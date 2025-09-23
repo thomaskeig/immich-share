@@ -1,4 +1,4 @@
-# Immich Photo Sync Script
+# immich-share
 
 A Python script that synchronizes photos and videos between two Immich accounts while respecting deletions and maintaining sync state.
 
