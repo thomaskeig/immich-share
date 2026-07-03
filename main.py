@@ -54,9 +54,14 @@ class ImmichAPI:
         try:
             # Use the search/metadata endpoint - the correct current API
             url = f"{self.base_url}/api/search/metadata"
+            # Immich v3 changed the default visibility of search results to
+            # include all assets (archived, hidden, etc.) instead of only
+            # "timeline" assets. Pin it to "timeline" to preserve the previous
+            # behaviour of only syncing regular timeline photos/videos.
             payload = {
                 "takenAfter": f"{start_date}T00:00:00.000Z",
-                "takenBefore": f"{end_date}T23:59:59.999Z"
+                "takenBefore": f"{end_date}T23:59:59.999Z",
+                "visibility": "timeline"
             }
             
             logger.info(f"Searching assets with payload: {payload}")
@@ -144,24 +149,14 @@ class ImmichAPI:
         try:
             # Remove Content-Type header for file uploads
             headers = {'X-API-KEY': self.api_key}
-            
+
             files = {
                 'assetData': (filename, file_data, 'application/octet-stream')
             }
-            
-            # Generate unique deviceAssetId and deviceId as required by API
-            import time
-            import hashlib
-            
-            # Create a unique deviceAssetId using filename and current timestamp
-            unique_id = f"{filename}-{int(time.time())}"
-            if source_asset_id:
-                # Use source asset ID to make it more unique
-                unique_id = f"sync-{source_asset_id}-{int(time.time())}"
-            
+
+            # Immich v3 removed the deviceAssetId and deviceId properties from
+            # POST /assets, so they are no longer sent (see v3 migration guide).
             data = {
-                'deviceAssetId': unique_id,
-                'deviceId': 'immich-sync-script',
                 'fileCreatedAt': file_created_at,
                 'fileModifiedAt': file_created_at,
                 'isFavorite': 'false'
