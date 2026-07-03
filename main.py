@@ -15,16 +15,34 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load configuration from a .env file (see .env.example)
+load_dotenv()
+
+
+def _require_env(name: str) -> str:
+    """Read a required environment variable or exit with a helpful message."""
+    value = os.getenv(name)
+    if not value:
+        sys.stderr.write(
+            f"Missing required configuration: {name}. "
+            f"Copy .env.example to .env and fill it in.\n"
+        )
+        sys.exit(1)
+    return value
+
+
 # Configuration
-IMMICH_BASE_URL = "https://photos.thomaskeig.com"
-API_KEY_2 = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-API_KEY_1 = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-SYNC_START_DATE = "2025-08-09"
-SYNC_END_DATE = "2025-08-20"
-SYNC_INTERVAL = 3600  # 1 hour in seconds
+IMMICH_BASE_URL = _require_env("IMMICH_BASE_URL")
+API_KEY_1 = _require_env("API_KEY_1")
+API_KEY_2 = _require_env("API_KEY_2")
+SYNC_START_DATE = _require_env("SYNC_START_DATE")
+SYNC_END_DATE = _require_env("SYNC_END_DATE")
+SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", "3600"))  # seconds
 
 # Database file for tracking sync state
-DB_FILE = "immich_sync.db"
+DB_FILE = os.getenv("DB_FILE", "immich_sync.db")
 
 # Set up logging
 logging.basicConfig(

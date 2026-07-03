@@ -1,0 +1,10 @@
+# Local environment / secrets
+.env
+
+# Sync state and logs
+immich_sync.db
+immich_sync.log
+
+# Python
+__pycache__/
+*.pyc
