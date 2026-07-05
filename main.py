@@ -9,6 +9,7 @@ import json
 import time
 import logging
 import sqlite3
+import tempfile
 from datetime import datetime, timedelta
 from typing import List, Dict, Set, Optional
 import os
@@ -16,6 +17,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+from requests_toolbelt.multipart.encoder import MultipartEncoder
 
 # Load configuration from a .env file (see .env.example)
 load_dotenv()
@@ -44,6 +46,15 @@ SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", "3600"))  # seconds
 # Database file for tracking sync state
 DB_FILE = os.getenv("DB_FILE", "immich_sync.db")
 
+# Streaming/transfer tuning. Assets are streamed straight from the source
+# account into the target account so the whole file never has to be held in
+# RAM. Only in the rare case where the download has no Content-Length do we
+# fall back to buffering the file (in a SpooledTemporaryFile that stays in RAM
+# up to STREAM_SPOOL_MAX_BYTES and then rolls over to disk in STREAM_TEMP_DIR).
+STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", str(1024 * 1024)))  # bytes
+STREAM_SPOOL_MAX_BYTES = int(os.getenv("STREAM_SPOOL_MAX_BYTES", str(8 * 1024 * 1024)))  # bytes
+STREAM_TEMP_DIR = os.getenv("STREAM_TEMP_DIR") or None  # None -> system default
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +65,39 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+class _LengthedStream:
+    """A minimal read-only file-like wrapper that advertises a known length.
+
+    ``MultipartEncoder`` needs to know the size of each part up front so it can
+    send an accurate ``Content-Length`` (and thus avoid chunked transfer
+    encoding, which some Immich/reverse-proxy setups reject). A raw network
+    download stream doesn't expose its length, so we attach it explicitly here
+    from the download's ``Content-Length`` header. Data is read lazily, so the
+    file is never fully materialised in memory.
+    """
+
+    def __init__(self, stream, length: int):
+        self._stream = stream
+        self._total = length
+        self._pos = 0
+
+    @property
+    def len(self) -> int:
+        # ``requests_toolbelt`` reads this to size the multipart body. It sizes
+        # the part once at construction (when pos == 0, giving the full length,
+        # hence the correct Content-Length) and then polls it while streaming to
+        # decide when the part is exhausted, so it must report *remaining* bytes.
+        return max(self._total - self._pos, 0)
+
+    def read(self, amt: int = -1) -> bytes:
+        data = self._stream.read(amt)
+        self._pos += len(data)
+        return data
+
+    def tell(self) -> int:
+        return self._pos
+
 
 class ImmichAPI:
     """Wrapper for Immich API operations"""
@@ -151,38 +195,53 @@ class ImmichAPI:
             logger.error(f"Error fetching asset info for {asset_id}: {e}")
             return None
     
-    def download_asset(self, asset_id: str) -> Optional[bytes]:
-        """Download asset binary data"""
+    def open_asset_stream(self, asset_id: str) -> Optional[requests.Response]:
+        """Open a streaming download of an asset's original file.
+
+        Returns the ``requests.Response`` (opened with ``stream=True``) so the
+        caller can pipe ``response.raw`` straight into an upload without ever
+        holding the whole file in memory. The caller owns the response and must
+        close it (ideally via a ``with`` block). Returns ``None`` on error.
+        """
         try:
             url = f"{self.base_url}/api/assets/{asset_id}/original"
-            response = self.session.get(url)
+            response = self.session.get(url, stream=True)
             response.raise_for_status()
-            return response.content
+            return response
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error downloading asset {asset_id}: {e}")
+            logger.error(f"Error opening download stream for asset {asset_id}: {e}")
             return None
-    
-    def upload_asset(self, file_data: bytes, filename: str, file_created_at: str, source_asset_id: str = None) -> Optional[str]:
-        """Upload an asset to Immich"""
+
+    def upload_asset_stream(self, file_stream, content_length: int, filename: str,
+                            file_created_at: str) -> Optional[str]:
+        """Upload an asset by streaming from a file-like object.
+
+        ``file_stream`` only needs to support ``read(size)``; ``content_length``
+        is the exact number of bytes it will yield, which lets us send a real
+        ``Content-Length`` instead of chunked transfer encoding. The body is
+        streamed, so a large asset never has to be buffered fully in memory.
+        """
         try:
-            # Remove Content-Type header for file uploads
-            headers = {'X-API-KEY': self.api_key}
-
-            files = {
-                'assetData': (filename, file_data, 'application/octet-stream')
-            }
-
-            # Immich v3 removed the deviceAssetId and deviceId properties from
-            # POST /assets, so they are no longer sent (see v3 migration guide).
-            data = {
+            # Wrap the stream so the multipart encoder knows the part's size.
+            part = _LengthedStream(file_stream, content_length)
+            encoder = MultipartEncoder(fields={
+                'assetData': (filename, part, 'application/octet-stream'),
+                # Immich v3 removed the deviceAssetId and deviceId properties
+                # from POST /assets, so they are no longer sent (see the v3
+                # migration guide).
                 'fileCreatedAt': file_created_at,
                 'fileModifiedAt': file_created_at,
-                'isFavorite': 'false'
+                'isFavorite': 'false',
+            })
+
+            headers = {
+                'X-API-KEY': self.api_key,
+                'Content-Type': encoder.content_type,
             }
-            
+
             url = f"{self.base_url}/api/assets"
-            response = requests.post(url, headers=headers, files=files, data=data)
-            
+            response = requests.post(url, headers=headers, data=encoder)
+
             logger.debug(f"Upload response status: {response.status_code}")
             logger.debug(f"Upload response: {response.text[:500]}")
             
@@ -314,7 +373,52 @@ class ImmichSyncManager:
         self.api1 = ImmichAPI(IMMICH_BASE_URL, API_KEY_1)
         self.api2 = ImmichAPI(IMMICH_BASE_URL, API_KEY_2)
         self.db = SyncDatabase(DB_FILE)
-    
+
+    def _transfer_asset(self, source_api: ImmichAPI, target_api: ImmichAPI,
+                        asset_id: str, filename: str,
+                        file_created_at: str) -> Optional[str]:
+        """Move one asset from source to target with minimal memory use.
+
+        The download is opened as a stream and piped straight into the upload,
+        so the asset is never fully held in RAM. If the download doesn't report
+        a Content-Length (so we can't set one on the upload), we fall back to
+        buffering it in a SpooledTemporaryFile, which stays in RAM only up to
+        STREAM_SPOOL_MAX_BYTES before spilling to disk. Returns the new target
+        asset id, or None on failure.
+        """
+        response = source_api.open_asset_stream(asset_id)
+        if response is None:
+            return None
+
+        try:
+            content_length = response.headers.get('Content-Length')
+
+            if content_length is not None:
+                # Preferred path: stream the download straight into the upload.
+                # Read the raw (undecoded) body so the byte count we forward
+                # exactly equals the Content-Length we advertise on the upload.
+                # Immich serves originals without content-encoding, so raw bytes
+                # are the real file.
+                response.raw.decode_content = False
+                return target_api.upload_asset_stream(
+                    response.raw, int(content_length), filename, file_created_at)
+
+            # Fallback: no Content-Length, so spool the download (RAM up to a
+            # threshold, then disk) to learn its size before uploading.
+            logger.info(
+                f"Asset {asset_id} has no Content-Length; buffering via spool file")
+            with tempfile.SpooledTemporaryFile(
+                    max_size=STREAM_SPOOL_MAX_BYTES, dir=STREAM_TEMP_DIR) as spool:
+                for chunk in response.iter_content(chunk_size=STREAM_CHUNK_SIZE):
+                    if chunk:
+                        spool.write(chunk)
+                size = spool.tell()
+                spool.seek(0)
+                return target_api.upload_asset_stream(
+                    spool, size, filename, file_created_at)
+        finally:
+            response.close()
+
     def detect_deletions(self):
         """Detect assets that were deleted from accounts"""
         logger.info("Detecting deleted assets...")
@@ -437,27 +541,22 @@ class ImmichSyncManager:
                     continue
                 
                 filename = asset_info.get('originalFileName', f"asset_{asset_id}")
-                
-                # Download asset
-                logger.info(f"Downloading asset {asset_id} ({filename})...")
-                file_data = source_api.download_asset(asset_id)
-                if not file_data:
-                    logger.warning(f"Could not download asset {asset_id}")
+                file_created_at = asset_info.get('fileCreatedAt', asset_info.get('createdAt'))
+
+                # Stream the asset straight from source to target so the file
+                # is never fully buffered in RAM.
+                logger.info(f"Transferring asset {asset_id} ({filename}) to account {target_account}...")
+                target_id = self._transfer_asset(
+                    source_api, target_api, asset_id, filename, file_created_at)
+                if not target_id:
+                    logger.warning(f"Could not transfer asset {asset_id}")
                     error_count += 1
                     continue
-                
-                # Upload to target account
-                file_created_at = asset_info.get('fileCreatedAt', asset_info.get('createdAt'))
-                
-                logger.info(f"Uploading {filename} to account {target_account}...")
-                target_id = target_api.upload_asset(file_data, filename, file_created_at, asset_id)
-                if target_id:
-                    self.db.record_sync(asset_id, target_id, source_account, target_account)
-                    synced_count += 1
-                    logger.info(f"Successfully synced {filename} (source: {asset_id} -> target: {target_id})")
-                else:
-                    error_count += 1
-                
+
+                self.db.record_sync(asset_id, target_id, source_account, target_account)
+                synced_count += 1
+                logger.info(f"Successfully synced {filename} (source: {asset_id} -> target: {target_id})")
+
                 # Small delay to avoid overwhelming the API
                 time.sleep(0.5)
                 

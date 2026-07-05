@@ -12,6 +12,7 @@ A Python script that synchronizes photos and videos between two Immich accounts 
 - **Comprehensive Logging**: Detailed logging to both file and console
 - **SQLite Database**: Maintains sync state and deletion history in a local database
 - **Asset Type Support**: Handles both images and videos
+- **Low Memory Footprint**: Streams each asset directly from one account to the other, so even large videos are never fully loaded into RAM
 - **Error Handling**: Robust error handling with retry logic
 
 ## Prerequisites
@@ -69,6 +70,9 @@ set in the shell take precedence over values in `.env`.
 | `SYNC_END_DATE` | Yes | End date for syncing assets (YYYY-MM-DD) | `2025-12-31` |
 | `SYNC_INTERVAL` | No | Time between sync cycles in seconds (default `3600`) | `3600` |
 | `DB_FILE` | No | SQLite state file (default `immich_sync.db`) | `immich_sync.db` |
+| `STREAM_CHUNK_SIZE` | No | Chunk size in bytes for the buffering fallback (default `1048576`) | `1048576` |
+| `STREAM_SPOOL_MAX_BYTES` | No | Bytes kept in RAM before the buffering fallback spills to disk (default `8388608`) | `8388608` |
+| `STREAM_TEMP_DIR` | No | Directory for temporary spill files (default: system temp dir) | `/home/container/tmp` |
 
 ### Getting API Keys
 
@@ -118,6 +122,21 @@ Press `Ctrl+C` to gracefully stop the continuous sync process.
 4. **State Tracking**: Records all sync operations in a local SQLite database
 5. **Duplicate Prevention**: Skips assets that have already been synced
 6. **Deletion Respect**: Won't re-sync assets that were intentionally deleted
+
+## Memory Usage
+
+Assets are transferred by opening a streaming download from the source account
+and piping it straight into the upload to the target account. The file is never
+fully held in memory, so peak RAM stays low (tens of MB) even for multi‑gigabyte
+videos — which makes the script well suited to memory‑constrained hosts such as
+Pterodactyl containers.
+
+In the rare case where Immich serves a download without a `Content-Length`
+header, the script falls back to buffering that file in a
+[`SpooledTemporaryFile`](https://docs.python.org/3/library/tempfile.html#tempfile.SpooledTemporaryFile),
+which keeps up to `STREAM_SPOOL_MAX_BYTES` in RAM before spilling to a temporary
+file on disk (in `STREAM_TEMP_DIR`). On hosts where the system temp directory is
+small or read‑only, point `STREAM_TEMP_DIR` at a writable location.
 
 ## Safety Features
 
